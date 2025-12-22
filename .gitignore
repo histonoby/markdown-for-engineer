@@ -4,10 +4,16 @@ node_modules/
 # Build outputs
 dist/
 src-tauri/target/
+dev-dist/
 
 # Executables
 *.exe
 *.msi
+
+# Environment variables (IMPORTANT: Never commit these!)
+.env
+.env.local
+.env.*.local
 
 # Logs
 *.log
@@ -21,3 +27,7 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Rust
+target/
+Cargo.lock

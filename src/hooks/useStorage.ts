@@ -1,6 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
-import { AppData, Project, LogEntry } from '../types';
+import { AppData, Project, LogEntry, ProjectStatus } from '../types';
+import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { v4 as uuidv4 } from 'uuid';
+import { User } from '@supabase/supabase-js';
+import { ProjectRow, LogRow } from '../types/database';
 
 const STORAGE_KEY = 'devlog-manager-data';
 
@@ -11,7 +14,7 @@ const getDefaultData = (): AppData => ({
 });
 
 // Load data from localStorage
-const loadData = (): AppData => {
+const loadLocalData = (): AppData => {
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored) {
@@ -24,7 +27,7 @@ const loadData = (): AppData => {
 };
 
 // Save data to localStorage
-const saveData = (data: AppData): void => {
+const saveLocalData = (data: AppData): void => {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
   } catch (error) {
@@ -32,26 +35,92 @@ const saveData = (data: AppData): void => {
   }
 };
 
-export function useStorage() {
+interface UseStorageOptions {
+  user: User | null;
+  useCloud: boolean;
+}
+
+export function useStorage({ user, useCloud }: UseStorageOptions) {
   const [data, setData] = useState<AppData>(getDefaultData);
   const [isLoading, setIsLoading] = useState(true);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
 
-  // Load data on mount
-  useEffect(() => {
-    const loaded = loadData();
-    setData(loaded);
-    setIsLoading(false);
-  }, []);
+  const isCloudMode = useCloud && isSupabaseConfigured() && user && supabase;
 
-  // Save data whenever it changes
-  useEffect(() => {
-    if (!isLoading) {
-      saveData(data);
+  // Supabaseからデータを読み込む
+  const loadCloudData = useCallback(async () => {
+    if (!user || !supabase) return getDefaultData();
+
+    try {
+      const [projectsRes, logsRes] = await Promise.all([
+        supabase.from('projects').select('*').eq('user_id', user.id),
+        supabase.from('logs').select('*').eq('user_id', user.id),
+      ]);
+
+      if (projectsRes.error) throw projectsRes.error;
+      if (logsRes.error) throw logsRes.error;
+
+      const projectsData = (projectsRes.data || []) as ProjectRow[];
+      const logsData = (logsRes.data || []) as LogRow[];
+
+      const projects: Project[] = projectsData.map((p) => ({
+        id: p.id,
+        name: p.name,
+        description: p.description || '',
+        status: p.status as ProjectStatus,
+        color: p.color,
+        createdAt: p.created_at,
+        updatedAt: p.updated_at,
+      }));
+
+      const logs: LogEntry[] = logsData.map((l) => ({
+        id: l.id,
+        projectId: l.project_id,
+        title: l.title,
+        content: l.content || '',
+        tags: l.tags || [],
+        createdAt: l.created_at,
+        updatedAt: l.updated_at,
+      }));
+
+      return { projects, logs };
+    } catch (error) {
+      console.error('Failed to load cloud data:', error);
+      setSyncError('クラウドデータの読み込みに失敗しました');
+      return getDefaultData();
     }
-  }, [data, isLoading]);
+  }, [user]);
+
+  // データを読み込む
+  useEffect(() => {
+    const loadData = async () => {
+      setIsLoading(true);
+      setSyncError(null);
+
+      if (isCloudMode) {
+        const cloudData = await loadCloudData();
+        setData(cloudData);
+      } else {
+        const localData = loadLocalData();
+        setData(localData);
+      }
+
+      setIsLoading(false);
+    };
+
+    loadData();
+  }, [isCloudMode, loadCloudData]);
+
+  // ローカルモードの場合、データ変更時に保存
+  useEffect(() => {
+    if (!isLoading && !isCloudMode) {
+      saveLocalData(data);
+    }
+  }, [data, isLoading, isCloudMode]);
 
   // Project operations
-  const createProject = useCallback((project: Omit<Project, 'id' | 'createdAt' | 'updatedAt'>): Project => {
+  const createProject = useCallback(async (project: Omit<Project, 'id' | 'createdAt' | 'updatedAt'>): Promise<Project> => {
     const now = new Date().toISOString();
     const newProject: Project = {
       ...project,
@@ -59,38 +128,108 @@ export function useStorage() {
       createdAt: now,
       updatedAt: now,
     };
+
+    if (isCloudMode && user) {
+      setIsSyncing(true);
+      try {
+        const { error } = await supabase.from('projects').insert({
+          id: newProject.id,
+          user_id: user.id,
+          name: newProject.name,
+          description: newProject.description,
+          status: newProject.status,
+          color: newProject.color,
+          created_at: newProject.createdAt,
+          updated_at: newProject.updatedAt,
+        } as ProjectRow);
+
+        if (error) throw error;
+      } catch (error) {
+        console.error('Failed to create project:', error);
+        setSyncError('プロジェクトの作成に失敗しました');
+      } finally {
+        setIsSyncing(false);
+      }
+    }
+
     setData(prev => ({
       ...prev,
       projects: [...prev.projects, newProject],
     }));
-    return newProject;
-  }, []);
 
-  const updateProject = useCallback((id: string, updates: Partial<Omit<Project, 'id' | 'createdAt'>>): void => {
+    return newProject;
+  }, [isCloudMode, user]);
+
+  const updateProject = useCallback(async (id: string, updates: Partial<Omit<Project, 'id' | 'createdAt'>>): Promise<void> => {
+    const now = new Date().toISOString();
+
+    if (isCloudMode && user) {
+      setIsSyncing(true);
+      try {
+        const updateData: Partial<ProjectRow> = { updated_at: now };
+        
+        if (updates.name !== undefined) updateData.name = updates.name;
+        if (updates.description !== undefined) updateData.description = updates.description;
+        if (updates.status !== undefined) updateData.status = updates.status;
+        if (updates.color !== undefined) updateData.color = updates.color;
+
+        const { error } = await supabase
+          .from('projects')
+          .update(updateData)
+          .eq('id', id)
+          .eq('user_id', user.id);
+
+        if (error) throw error;
+      } catch (error) {
+        console.error('Failed to update project:', error);
+        setSyncError('プロジェクトの更新に失敗しました');
+      } finally {
+        setIsSyncing(false);
+      }
+    }
+
     setData(prev => ({
       ...prev,
       projects: prev.projects.map(p =>
         p.id === id
-          ? { ...p, ...updates, updatedAt: new Date().toISOString() }
+          ? { ...p, ...updates, updatedAt: now }
           : p
       ),
     }));
-  }, []);
+  }, [isCloudMode, user]);
 
-  const deleteProject = useCallback((id: string): void => {
+  const deleteProject = useCallback(async (id: string): Promise<void> => {
+    if (isCloudMode && user) {
+      setIsSyncing(true);
+      try {
+        const { error } = await supabase
+          .from('projects')
+          .delete()
+          .eq('id', id)
+          .eq('user_id', user.id);
+
+        if (error) throw error;
+      } catch (error) {
+        console.error('Failed to delete project:', error);
+        setSyncError('プロジェクトの削除に失敗しました');
+      } finally {
+        setIsSyncing(false);
+      }
+    }
+
     setData(prev => ({
       ...prev,
       projects: prev.projects.filter(p => p.id !== id),
       logs: prev.logs.filter(l => l.projectId !== id),
     }));
-  }, []);
+  }, [isCloudMode, user]);
 
   const getProject = useCallback((id: string): Project | undefined => {
     return data.projects.find(p => p.id === id);
   }, [data.projects]);
 
   // Log operations
-  const createLog = useCallback((log: Omit<LogEntry, 'id' | 'createdAt' | 'updatedAt'>): LogEntry => {
+  const createLog = useCallback(async (log: Omit<LogEntry, 'id' | 'createdAt' | 'updatedAt'>): Promise<LogEntry> => {
     const now = new Date().toISOString();
     const newLog: LogEntry = {
       ...log,
@@ -98,45 +237,132 @@ export function useStorage() {
       createdAt: now,
       updatedAt: now,
     };
+
+    if (isCloudMode && user) {
+      setIsSyncing(true);
+      try {
+        const { error } = await supabase.from('logs').insert({
+          id: newLog.id,
+          user_id: user.id,
+          project_id: newLog.projectId,
+          title: newLog.title,
+          content: newLog.content,
+          tags: newLog.tags,
+          created_at: newLog.createdAt,
+          updated_at: newLog.updatedAt,
+        } as LogRow);
+
+        if (error) throw error;
+
+        // Update project's updated_at
+        await supabase
+          .from('projects')
+          .update({ updated_at: now } as Partial<ProjectRow>)
+          .eq('id', log.projectId)
+          .eq('user_id', user.id);
+      } catch (error) {
+        console.error('Failed to create log:', error);
+        setSyncError('ログの作成に失敗しました');
+      } finally {
+        setIsSyncing(false);
+      }
+    }
+
     setData(prev => ({
       ...prev,
       logs: [...prev.logs, newLog],
+      projects: prev.projects.map(p =>
+        p.id === log.projectId
+          ? { ...p, updatedAt: now }
+          : p
+      ),
     }));
-    // Update project's updatedAt
-    updateProject(log.projectId, {});
+
     return newLog;
-  }, [updateProject]);
+  }, [isCloudMode, user]);
 
-  const updateLog = useCallback((id: string, updates: Partial<Omit<LogEntry, 'id' | 'createdAt'>>): void => {
-    setData(prev => {
-      const log = prev.logs.find(l => l.id === id);
-      if (log) {
-        // Also update project's updatedAt
+  const updateLog = useCallback(async (id: string, updates: Partial<Omit<LogEntry, 'id' | 'createdAt'>>): Promise<void> => {
+    const now = new Date().toISOString();
+    const log = data.logs.find(l => l.id === id);
+
+    if (isCloudMode && user && log) {
+      setIsSyncing(true);
+      try {
+        const updateData: Partial<LogRow> = { updated_at: now };
+        
+        if (updates.title !== undefined) updateData.title = updates.title;
+        if (updates.content !== undefined) updateData.content = updates.content;
+        if (updates.tags !== undefined) updateData.tags = updates.tags;
+        if (updates.projectId !== undefined) updateData.project_id = updates.projectId;
+
+        const { error } = await supabase
+          .from('logs')
+          .update(updateData)
+          .eq('id', id)
+          .eq('user_id', user.id);
+
+        if (error) throw error;
+
+        // Update project's updated_at
         const projectId = updates.projectId || log.projectId;
-        return {
-          ...prev,
-          logs: prev.logs.map(l =>
-            l.id === id
-              ? { ...l, ...updates, updatedAt: new Date().toISOString() }
-              : l
-          ),
-          projects: prev.projects.map(p =>
-            p.id === projectId
-              ? { ...p, updatedAt: new Date().toISOString() }
-              : p
-          ),
-        };
+        await supabase
+          .from('projects')
+          .update({ updated_at: now } as Partial<ProjectRow>)
+          .eq('id', projectId)
+          .eq('user_id', user.id);
+      } catch (error) {
+        console.error('Failed to update log:', error);
+        setSyncError('ログの更新に失敗しました');
+      } finally {
+        setIsSyncing(false);
       }
-      return prev;
-    });
-  }, []);
+    }
 
-  const deleteLog = useCallback((id: string): void => {
+    setData(prev => {
+      const existingLog = prev.logs.find(l => l.id === id);
+      if (!existingLog) return prev;
+
+      const projectId = updates.projectId || existingLog.projectId;
+      return {
+        ...prev,
+        logs: prev.logs.map(l =>
+          l.id === id
+            ? { ...l, ...updates, updatedAt: now }
+            : l
+        ),
+        projects: prev.projects.map(p =>
+          p.id === projectId
+            ? { ...p, updatedAt: now }
+            : p
+        ),
+      };
+    });
+  }, [isCloudMode, user, data.logs]);
+
+  const deleteLog = useCallback(async (id: string): Promise<void> => {
+    if (isCloudMode && user) {
+      setIsSyncing(true);
+      try {
+        const { error } = await supabase
+          .from('logs')
+          .delete()
+          .eq('id', id)
+          .eq('user_id', user.id);
+
+        if (error) throw error;
+      } catch (error) {
+        console.error('Failed to delete log:', error);
+        setSyncError('ログの削除に失敗しました');
+      } finally {
+        setIsSyncing(false);
+      }
+    }
+
     setData(prev => ({
       ...prev,
       logs: prev.logs.filter(l => l.id !== id),
     }));
-  }, []);
+  }, [isCloudMode, user]);
 
   const getLog = useCallback((id: string): LogEntry | undefined => {
     return data.logs.find(l => l.id === id);
@@ -158,10 +384,60 @@ export function useStorage() {
     return data.logs.filter(l => l.projectId === projectId).length;
   }, [data.logs]);
 
+  // Sync local data to cloud
+  const syncToCloud = useCallback(async (): Promise<void> => {
+    if (!user || !isSupabaseConfigured()) return;
+
+    setIsSyncing(true);
+    setSyncError(null);
+
+    try {
+      // Upload all local projects
+      for (const project of data.projects) {
+        const { error } = await supabase.from('projects').upsert({
+          id: project.id,
+          user_id: user.id,
+          name: project.name,
+          description: project.description,
+          status: project.status,
+          color: project.color,
+          created_at: project.createdAt,
+          updated_at: project.updatedAt,
+        } as ProjectRow);
+
+        if (error) throw error;
+      }
+
+      // Upload all local logs
+      for (const log of data.logs) {
+        const { error } = await supabase.from('logs').upsert({
+          id: log.id,
+          user_id: user.id,
+          project_id: log.projectId,
+          title: log.title,
+          content: log.content,
+          tags: log.tags,
+          created_at: log.createdAt,
+          updated_at: log.updatedAt,
+        } as LogRow);
+
+        if (error) throw error;
+      }
+    } catch (error) {
+      console.error('Failed to sync to cloud:', error);
+      setSyncError('クラウド同期に失敗しました');
+    } finally {
+      setIsSyncing(false);
+    }
+  }, [user, data]);
+
   return {
     projects: data.projects,
     logs: data.logs,
     isLoading,
+    isSyncing,
+    syncError,
+    isCloudMode: !!isCloudMode,
     // Project operations
     createProject,
     updateProject,
@@ -175,6 +451,7 @@ export function useStorage() {
     getProjectLogs,
     getRecentLogs,
     getLogCountByProject,
+    // Sync
+    syncToCloud,
   };
 }
-
