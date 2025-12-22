@@ -15,7 +15,6 @@ function App() {
     isAuthenticated,
     signIn,
     signUp,
-    signInWithGitHub,
     signInWithGoogle,
     signOut,
   } = useAuth();
@@ -190,7 +189,6 @@ function App() {
       <AuthScreen
         onSignIn={signIn}
         onSignUp={signUp}
-        onSignInWithGitHub={signInWithGitHub}
         onSignInWithGoogle={signInWithGoogle}
         onSkipAuth={handleSkipAuth}
         isConfigured={isConfigured}
